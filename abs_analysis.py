@@ -114,6 +114,23 @@ def fetch_abs_leaderboard(
     # Normalize common column name variants
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
 
+    # Map Savant API column names to the canonical names used by this module
+    col_rename = {
+        "entity_name": "player_name",
+        "team_abbr": "team_abbrev",
+        "n_challenges": "challenges",
+        "n_overturns": "overturns",
+        "n_confirms": "confirms",
+        "rate_overturns": "overturn_rate",
+        "exp_chal": "expected_challenges",
+        "exp_rate_challenges": "challenge_rate",
+        "n_challenges_against": "opp_challenges",
+        "n_overturns_against": "opp_overturns",
+        "rate_overturns_against": "opp_overturn_rate",
+        "net_for": "delta_win_exp",
+    }
+    df.rename(columns={k: v for k, v in col_rename.items() if k in df.columns}, inplace=True)
+
     # Ensure numeric types
     numeric_cols = [
         "challenges", "overturns", "overturn_rate", "challenge_rate",
@@ -340,6 +357,10 @@ def win_exp_by_challenge(challenge_pitches: pd.DataFrame) -> pd.DataFrame:
 
     Requires 'delta_home_win_exp' (or similar) column in pitch data.
     """
+    if challenge_pitches.empty or "challenger" not in challenge_pitches.columns:
+        print("  No challenge pitch data available for win expectancy breakdown.")
+        return pd.DataFrame()
+
     win_col = next(
         (c for c in challenge_pitches.columns if "delta" in c and "win" in c),
         None,
