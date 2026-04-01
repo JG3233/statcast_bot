@@ -18,6 +18,7 @@ Usage:
 """
 
 import io
+import re
 import warnings
 import requests
 import pandas as pd
@@ -175,12 +176,26 @@ def fetch_abs_leaderboards_combined(
 # Pitch-level Statcast data
 # ---------------------------------------------------------------------------
 
+_ABS_CHALLENGE_RE = re.compile(
+    r"^(.+?)\s+challenged\s+\(pitch result\),\s+call on the field was\s+(confirmed|overturned)",
+    re.IGNORECASE,
+)
+
+
 def fetch_statcast_abs_pitches(
     start_date: str,
     end_date: str,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Pull Statcast pitch-by-pitch data and isolate ABS challenge events.
+
+    ABS challenges are identified from the ``des`` (play description) column,
+    which contains narrative text like::
+
+        "Matt Olson challenged (pitch result), call on the field was confirmed: ..."
+
+    Only "(pitch result)" challenges are matched — play reviews (e.g.
+    "challenged (play at 1st)") are excluded.
 
     Parameters
     ----------
@@ -190,36 +205,63 @@ def fetch_statcast_abs_pitches(
     -------
     (all_pitches, challenge_pitches) : tuple of DataFrames
         all_pitches       – full Statcast pull for the date range
-        challenge_pitches – rows where an ABS challenge was triggered
+        challenge_pitches – rows where an ABS challenge was triggered,
+                            with added columns: is_overturn, challenger,
+                            challenger_name
     """
     print(f"Fetching Statcast data {start_date} → {end_date} …")
     all_pitches = statcast(start_dt=start_date, end_dt=end_date)
     all_pitches.columns = [c.strip().lower() for c in all_pitches.columns]
 
-    if "description" in all_pitches.columns:
-        challenge_pitches = all_pitches[
-            all_pitches["description"].isin(ABS_CHALLENGE_DESCRIPTIONS)
-        ].copy()
+    if "des" in all_pitches.columns:
+        mask = all_pitches["des"].str.contains(
+            r"challenged\s+\(pitch result\)", case=False, na=False
+        )
+        challenge_pitches = all_pitches[mask].copy()
     else:
-        print("  Warning: 'description' column not found; returning empty challenge df.")
+        print("  Warning: 'des' column not found; returning empty challenge df.")
         challenge_pitches = pd.DataFrame(columns=all_pitches.columns)
 
-    # Add convenience flags
+    # Add convenience flags parsed from the narrative description
     if not challenge_pitches.empty:
-        challenge_pitches["is_overturn"] = challenge_pitches["description"].isin(
-            OVERTURN_DESCRIPTIONS
-        )
-        challenge_pitches["challenger"] = challenge_pitches["description"].apply(
-            lambda d: "batter"
-            if d in {"called_strike_challenge", "called_strike_overturned"}
-            else "pitcher_catcher"
-        )
+        parsed = challenge_pitches["des"].apply(_parse_abs_challenge)
+        challenge_pitches["is_overturn"] = parsed.apply(lambda p: p[1])
+        challenge_pitches["challenger_name"] = parsed.apply(lambda p: p[0])
+
+        # Determine batter vs pitcher/catcher from the description column:
+        # called_strike → batter challenged a strike call
+        # ball → pitcher/catcher challenged a ball call
+        if "description" in challenge_pitches.columns:
+            challenge_pitches["challenger"] = challenge_pitches["description"].apply(
+                lambda d: "batter" if d == "called_strike" else "pitcher_catcher"
+            )
+        else:
+            challenge_pitches["challenger"] = "unknown"
 
     print(
         f"  Total pitches: {len(all_pitches):,} | "
         f"ABS challenge events: {len(challenge_pitches):,}"
     )
     return all_pitches, challenge_pitches
+
+
+def _parse_abs_challenge(des: str) -> tuple[str, bool]:
+    """Extract challenger name and overturn status from a des string."""
+    m = _ABS_CHALLENGE_RE.search(des)
+    if m:
+        return m.group(1).strip(), m.group(2).lower() == "overturned"
+    return "", False
+
+
+def _name_match(challenger_name: str, player_name: str) -> bool:
+    """Fuzzy check whether the challenger is the batter at the plate."""
+    if not challenger_name or not player_name:
+        return False
+    # player_name from Statcast is typically "Last, First" or "First Last"
+    cn = challenger_name.lower().split()
+    pn = player_name.lower().replace(",", "").split()
+    # Check if last name appears in both
+    return bool(set(cn) & set(pn))
 
 
 # ---------------------------------------------------------------------------
@@ -329,16 +371,15 @@ def challenge_by_count(challenge_pitches: pd.DataFrame) -> pd.DataFrame:
     Returns a pivot-ready DataFrame with columns:
         balls, strikes, n_challenges, n_overturns, overturn_rate
     """
-    needed = {"balls", "strikes", "description"}
+    needed = {"balls", "strikes", "is_overturn"}
     if not needed.issubset(challenge_pitches.columns):
         return pd.DataFrame()
 
     df = challenge_pitches.copy()
-    df["is_overturn"] = df["description"].isin(OVERTURN_DESCRIPTIONS)
 
     count_stats = (
         df.groupby(["balls", "strikes"])
-        .agg(n_challenges=("description", "count"),
+        .agg(n_challenges=("is_overturn", "count"),
              n_overturns=("is_overturn", "sum"))
         .reset_index()
     )
@@ -370,12 +411,11 @@ def win_exp_by_challenge(challenge_pitches: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = challenge_pitches.copy()
-    df["is_overturn"] = df["description"].isin(OVERTURN_DESCRIPTIONS)
 
     return (
         df.groupby(["challenger", "is_overturn"])
         .agg(
-            n=("description", "count"),
+            n=("is_overturn", "count"),
             avg_delta_win_exp=(win_col, "mean"),
             total_delta_win_exp=(win_col, "sum"),
         )
